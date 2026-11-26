@@ -1,13 +1,16 @@
 #!/bin/bash
+set -euo pipefail
 
 FILES='readr.f90 readhtm.f90 hilbert3d.f90 io_ramses.f90'
 # FILES='readhtm.f90'
-F2PY=f2py
+PYTHON=${PYTHON:-python}
+F2PY="$PYTHON -m numpy.f2py"
 FORT=gfortran # or "ifort"
 MACHINE="tardis" # or "tardis"
-BASEDIR=$(dirname "$0")
+BASEDIR=$(cd "$(dirname "$0")" && pwd)
+export SETUPTOOLS_USE_DISTUTILS=${SETUPTOOLS_USE_DISTUTILS:-stdlib}
 
-cd $BASEDIR/rur
+cd "$BASEDIR/rur"
 for f in $FILES
 do
     bn=$(basename "$f" .f90)
@@ -33,21 +36,22 @@ do
         fi
     fi
 done
-rm *.o *.mod
+rm -f *.o *.mod
 
-# exit 0
+if [ "${RUR_BUILD_VR:-0}" != "1" ]; then
+    exit 0
+fi
 
-For VR part
 cd ..
 FILES='find_domain_py.f90  get_flux_py.f90  get_ptcl_py.f90  jsamr2cell_py.f90  jsamr2cell_totnum_py.f90  js_gasmap_py.f90  js_getpt_ft.f90  jsrd_part_totnum_py.f90  jsrd_part_py.f90 js_getsfe_ft.f90'
 
 FORT=gfortran
-cd $BASEDIR/rur/vr/fortran
+cd "$BASEDIR/rur/vr/fortran"
 for f in $FILES
 do
   bn=$(basename "$f" .f90)
   echo -e "\n\n\nCompiling $bn\n\n\n"
-  if [$MACHINE == "tardis" ]; then
+  if [ "$MACHINE" == "tardis" ]; then
     export CFLAGS="-fPIC -O2 -std=c99"
   fi
   $F2PY -m $bn --fcompiler=$FORT --f90flags='-fopenmp' -lgomp -c $f

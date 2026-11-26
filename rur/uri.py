@@ -715,12 +715,14 @@ class RamsesSnapshot(object):
     """
 
     def __init__(self, repo, iout, mode='none', box=None, path_in_repo=default_path_in_repo['snapshots'], snap=None,
-                 longint=False, verbose=None, z=None, hdf=False, simple_boundary=False):
+                 longint=False, verbose=None, z=None, hdf=False, simple_boundary=False, hdf_path=None):
         self.repo = repo
         self.path_in_repo = path_in_repo
         self.snap_path = join(repo, path_in_repo)
         self.verbose = timer.verbose if verbose is None else verbose
         self.hdf = hdf
+        # Snapshot storage may live separately from catalogues and merger trees.
+        self.hdf_path = join(repo, 'hdf') if hdf_path is None else os.path.abspath(os.path.expanduser(os.fspath(hdf_path)))
         self.simple_boundary = simple_boundary
 
         if z is not None:
@@ -911,13 +913,17 @@ class RamsesSnapshot(object):
         self.flush(parent='[__del__]')
 
     def get_iout_avail(self):
+        if self.hdf:
+            filenames = glob.glob(join(self.hdf_path, 'part_[0-9][0-9][0-9][0-9][0-9].h5'))
+            filenames += glob.glob(join(self.hdf_path, 'cell_[0-9][0-9][0-9][0-9][0-9].h5'))
+            return np.array(sorted({int(os.path.basename(path)[5:10]) for path in filenames}), dtype=int)
         output_names = glob.glob(join(self.snap_path, output_glob))
         iouts = [int(arr[-5:]) for arr in output_names]
         return np.sort(iouts)
 
     def switch_iout(self, iout):
         # returns to other snapshot while maintaining repository, box, etc.
-        return RamsesSnapshot(self.repo, iout, self.mode, self.box, self.path_in_repo, snap=self, longint=self.longint, verbose=self.verbose, hdf=self.hdf, simple_boundary=self.simple_boundary)
+        return RamsesSnapshot(self.repo, iout, self.mode, self.box, self.path_in_repo, snap=self, longint=self.longint, verbose=self.verbose, hdf=self.hdf, simple_boundary=self.simple_boundary, hdf_path=self.hdf_path)
 
     def __getitem__(self, item):
         try:
@@ -934,9 +940,9 @@ class RamsesSnapshot(object):
         if(type == 'namelist'):
             return join(self.path, "namelist.txt")
         if type == 'hdf_part':
-            return join(self.repo, f"hdf/part_{self.iout:05d}.h5")
+            return join(self.hdf_path, f"part_{self.iout:05d}.h5")
         elif type == 'hdf_cell':
-            return join(self.repo, f"hdf/cell_{self.iout:05d}.h5")
+            return join(self.hdf_path, f"cell_{self.iout:05d}.h5")
         if(self.mode=='ng'): return join(self.path, f"{type}.out{icpu:05d}")
         return join(self.path, f"{type}_{self.iout:05d}.out{icpu:05d}")
 
@@ -2288,11 +2294,14 @@ class RamsesSnapshot(object):
                 domain_slicing = True
             exact_box = False
 
-        if(target_fields=='basic'):
+        if isinstance(target_fields, str) and target_fields == 'basic':
             target_fields = ['x', 'y', 'z', 'vx', 'vy', 'vz', 'rho','P','level', 'cpu']
 
         if hdf:
-            return self.get_cell_hdf(box=box, target_fields=target_fields, domain_slicing=domain_slicing, exact_box=exact_box, read_branch=read_branch, nthread=nthread, legacy=legacy, htype=htype, levelmax=levelmax)
+            self.cell = self.get_cell_hdf(box=box, target_fields=target_fields, domain_slicing=domain_slicing, exact_box=exact_box, read_branch=read_branch, nthread=nthread, legacy=legacy, htype=htype, levelmax=levelmax)
+            self.cell_data = self.cell.table
+            self.box_cell = None if self.box is None else self.box.copy()
+            return self.cell
         
         if (self.box is None or not np.array_equal(self.box, self.box_cell) or cpulist is not None):
             if (cpulist is None):
@@ -2376,7 +2385,10 @@ class RamsesSnapshot(object):
         if hdf:
             if pname is None:
                 raise ValueError("Particle type (pname) must be specified when using HDF5 mode.")
-            return self.get_part_hdf(pname, box=box, target_fields=target_fields, domain_slicing=domain_slicing, exact_box=exact_box, nthread=nthread, legacy=legacy, htype=htype)
+            self.part = self.get_part_hdf(pname, box=box, target_fields=target_fields, domain_slicing=domain_slicing, exact_box=exact_box, nthread=nthread, legacy=legacy, htype=htype)
+            self.part_data = self.part.table
+            self.box_part = None if self.box is None else self.box.copy()
+            return self.part
         
         do = False
         if self.part is not None:
@@ -3693,6 +3705,15 @@ def domain_slice(array, cpulist, bound, cpulist_all=None, cpulist_end=None, targ
         starts, ends = merge_segments(starts, ends)
     doms = np.stack([bound[starts], bound[ends]], axis=-1)
     segs = doms[:, 1] - doms[:, 0]
+    if domain_slicing and not np.any(segs):
+        if array is None:
+            with h5py.File(hdf_path, 'r') as hdf:
+                dtype = hdf[hdf_group]['data'].dtype
+        else:
+            dtype = array.dtype
+        if target_fields is not None:
+            dtype = np.dtype([(name, dtype[name]) for name in target_fields])
+        return np.empty(0, dtype=dtype)
     nthread = min(nthread, len(segs))  # avoid too many threads for small segments
 
     if legacy:
@@ -3720,13 +3741,15 @@ def domain_slice(array, cpulist, bound, cpulist_all=None, cpulist_end=None, targ
         if (nthread==1)or(hdf_path is None):
             if array is None:
                 with h5py.File(hdf_path, 'r') as hdf:
-                    grp = hdf[hdf_group]
-                    array = grp['data'][:]
+                    return domain_slice(hdf[hdf_group]['data'], cpulist, bound,
+                                        cpulist_all=cpulist_all, cpulist_end=cpulist_end,
+                                        target_fields=target_fields, legacy=legacy,
+                                        nthread=1, domain_slicing=domain_slicing, Nchunk=Nchunk)
             if target_fields is None:
                 # -----------------------------------
                 # SY Update: No need to domain slice if this case
                 if len(segs)==1:
-                    if segs[0] == doms[0,1]:
+                    if doms[0,0] == 0 and doms[0,1] == array.shape[0]:
                         return array[:]
                 # -----------------------------------
                 new_dtype = array.dtype
@@ -3753,7 +3776,7 @@ def domain_slice(array, cpulist, bound, cpulist_all=None, cpulist_end=None, targ
                 array = grp['data']
                 if target_fields is None:
                     if len(segs)==1:
-                        if segs[0] == doms[0,1]:
+                        if doms[0,0] == 0 and doms[0,1] == array.shape[0]:
                             return array[:]
                     new_dtype = np.dtype(array.dtype)
                 else:

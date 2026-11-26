@@ -38,6 +38,22 @@ conda develop .
 ```
 [f2py.sh](f2py.sh) should be run whenever there is a change in Fortran (*.f90) files.
 
+The core build was checked with Python 3.10.20, NumPy 1.26.4,
+setuptools 84.0.0, and GNU Fortran 9.4.0. The script uses NumPy's legacy
+`numpy.distutils` build path, so use Python 3.10 and NumPy 1.26 for this
+workflow. Build with the same interpreter that will import RUR; when called
+from Julia, this must match PythonCall's interpreter.
+
+```bash
+# After installing requirements.txt in the selected Python environment:
+PYTHON=/absolute/path/to/python3.10 ./f2py.sh
+/absolute/path/to/python3.10 -m unittest discover -s tests -p test_hdf_compatibility.py
+```
+
+The default build compiles the four core reader modules. Set `RUR_BUILD_VR=1`
+to additionally build the optional VR modules. Compiled extensions are local
+build products and are not part of the source checkout.
+
 Usage
 -----------------------------
 
@@ -123,3 +139,33 @@ painter.draw_gasmap(snap.cell, proj=proj, mode='rho', shape=1000)
 plt.show()
 ```
 ![Tutorial](rur_tutorial.png)
+
+### NewCluster HDF5 snapshots
+
+Use `hdf=True` to read snapshot metadata and particle/cell data from HDF5.
+The optional `hdf_path` points to the directory containing `part_XXXXX.h5`
+and `cell_XXXXX.h5`; it defaults to `<repo>/hdf`. Catalogue, membership,
+and merger-tree paths remain rooted at `repo`.
+
+```python
+from rur import uri
+
+snap = uri.RamsesSnapshot(
+    "/storage7/NewCluster", 1010, mode="nc", hdf=True,
+    hdf_path="/storage8/NewCluster/hdf",
+    box=[[0.45814, 0.45816], [0.47036, 0.47038], [0.41864, 0.41867]],
+)
+star = snap.get_part(pname="star", nthread=1)
+cell = snap.get_cell(nthread=1)
+```
+
+HDF mode accepts the native field names and compound integer Hilbert indexes
+in the converted NewCluster files, and returns the usual RUR field aliases.
+The returned objects also populate `snap.part` and `snap.cell`.
+Snapshot discovery and `switch_iout()` retain the HDF storage directory.
+Select a region before reading these large files.
+
+Run the bounded-I/O and storage regressions with
+`python -m unittest discover -s tests -p test_hdf_compatibility.py`.
+The optional `tests/check_newcluster_hdf.py` compares small real raw/HDF
+regions without writing simulation files.
